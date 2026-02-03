@@ -9,9 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 
-# ==========================================
 # 1. CONFIGURATION & SETUP
-# ==========================================
 app = FastAPI(title="Property Finder Hybrid AI Engine", version="2.0.0")
 
 # CORS: Allow all for now
@@ -33,9 +31,7 @@ ENGINE = {
 # Standard mappings
 OFFERING_MAP = {"sale": "1", "buy": "1", "rent": "2", "commercial": "3"}
 
-# ==========================================
 # 2. LIFECYCLE EVENTS
-# ==========================================
 @app.on_event("startup")
 async def startup_event():
     print("⏳ [System] Initializing Engine...")
@@ -65,9 +61,7 @@ async def startup_event():
     except Exception as e:
         print(f"❌ [Critical] Data Load Failed: {e}")
 
-# ==========================================
 # 3. UTILITY FUNCTIONS
-# ==========================================
 def calculate_freshness(dates):
     now = datetime.now()
     delta = (now - dates).dt.days
@@ -82,7 +76,7 @@ def haversine_vectorized(lat1, lon1, lat_series, lon_series):
     a = np.sin(dphi/2)**2 + np.cos(phi1)*np.cos(phi2)*np.sin(dlambda/2)**2
     return R * 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
 
-# --- NEW: SAFETY HELPER ---
+# SAFETY HELPER
 def safe_float(val, precision=1):
     """Converts NaN/Inf to 0.0 to prevent JSON crashes"""
     try:
@@ -93,9 +87,7 @@ def safe_float(val, precision=1):
     except:
         return 0.0
 
-# ==========================================
 # 4. API REQUEST MODELS
-# ==========================================
 class UserProfile(BaseModel):
     target_price: Optional[float] = None
     target_lat: Optional[float] = None
@@ -114,10 +106,8 @@ class SearchRequest(BaseModel):
     sort_by: str = "relevance"
     user_profile: Optional[UserProfile] = None
 
-# ==========================================
 # 5. RECOMMENDATION ENDPOINT
-# ==========================================
-@app.post("/api/v1/recommend")
+ @app.post("/api/v1/recommend")
 async def recommend(req: SearchRequest):
     df = ENGINE['database']
     if df.empty: return {"status": "error", "message": "Database not ready"}
@@ -272,4 +262,5 @@ async def recommend(req: SearchRequest):
             "radius_logic": search_radius_tag
         },
         "results": results
+
     }
