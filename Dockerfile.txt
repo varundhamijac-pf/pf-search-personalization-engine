@@ -1,0 +1,35 @@
+# 1. Base Image: Lightweight Python 3.9
+FROM python:3.9-slim
+
+# 2. Set Environment Variables
+# Prevents Python from writing .pyc files
+ENV PYTHONDONTWRITEBYTECODE=1 
+# Keeps Python from buffering stdout/stderr (logs appear immediately)
+ENV PYTHONUNBUFFERED=1 
+
+# 3. Set Working Directory
+WORKDIR /app
+
+# 4. Install System Dependencies
+# libgomp1 is strictly required for XGBoost to run
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 5. Install Python Dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 6. Copy Application Files
+# We copy the API code and the Production Data Assets
+COPY app_2.py .
+COPY light_brain.pkl .
+COPY listings.parquet .
+
+# 7. Expose the API Port
+EXPOSE 8000
+
+# 8. Define the Start Command
+# Uses uvicorn to run the FastAPI app
+CMD ["uvicorn", "app_2:app", "--host", "0.0.0.0", "--port", "8000"]
