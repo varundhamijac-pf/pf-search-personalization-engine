@@ -354,4 +354,5 @@ async def search(req: ProtoSearchRequest):
     return {
         "meta": { "total_count": len(pool), "page": page, "search_method": search_method },
         "properties": results
+
     }
