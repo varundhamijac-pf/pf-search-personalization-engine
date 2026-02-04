@@ -3,8 +3,10 @@ import os
 from sqlalchemy import create_engine 
 # NOTE: If using Snowflake, import snowflake.connector instead
 
+# ==========================================
 # 1. CONFIGURATION & CREDENTIALS
-# Update Production DB details
+# ==========================================
+# Update these with your Production DB details
 DB_CONFIG = {
     "host": "your-db-host.redshift.amazonaws.com",
     "port": "5439",
@@ -16,7 +18,8 @@ DB_CONFIG = {
 OUTPUT_FILE = 'listings.parquet'
 TRAINING_DATA_FILE = 'user_interactions.csv' # For the monthly training loop
 
-# 2. SQL QUERIES 
+# ==========================================
+# 2. SQL QUERIES (From your uploaded files)
 # ==========================================
 
 # Source: Listing_Query.txt [cite: 1, 2, 3, 5]
@@ -84,9 +87,11 @@ WHERE derived_timestamp >= DATEADD(day, -90, GETDATE())
 GROUP BY listing_web_id;
 """
 
+# ==========================================
 # 3. ETL LOGIC
+# ==========================================
 def get_db_engine():
-    # Example - Redshift/Postgres. Modify DB driver.
+    # Example for Redshift/Postgres. Modify for your specific DB driver.
     conn_str = f"postgresql+psycopg2://{DB_CONFIG['user']}:{DB_CONFIG['password']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
     return create_engine(conn_str)
 
@@ -94,7 +99,7 @@ def run_etl():
     print(" Connecting to Data Warehouse...")
     engine = get_db_engine()
 
-    # 1. Fetch Inventory (The listings)
+    # 1. Fetch Inventory (The Houses)
     print(" Executing Inventory Query...")
     df_inventory = pd.read_sql(QUERY_INVENTORY, engine)
     print(f"    Loaded {len(df_inventory)} active listings.")
@@ -123,5 +128,4 @@ def run_etl():
     print("ETL Complete. listings.parquet is ready for the API.")
 
 if __name__ == "__main__":
-
     run_etl()
