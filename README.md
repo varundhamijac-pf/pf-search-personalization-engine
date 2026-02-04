@@ -35,7 +35,7 @@ We moved away from CSVs to **Parquet** for performance. The pipeline handles:
     * `freshness_score` (Time decay).
     * `trust_score` (Agent quality).
 
-### C. The API (`app_7.py`)
+### C. The API (`app.py`)
 A high-performance **FastAPI** service that loads the Data and Brain into **RAM** for sub-50ms inference.
 
 ---
