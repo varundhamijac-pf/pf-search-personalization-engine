@@ -1,4 +1,4 @@
-# Property Finder Recommendation Engine (v6.6.0)
+# Property Finder Recommendation Engine 
 
 > **Status:** Production Ready (Phase 1)  
 > **Type:** Hybrid Filtering + Learning-to-Rank (LTR) AI  
