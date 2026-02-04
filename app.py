@@ -9,9 +9,8 @@ from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from enum import Enum
 
-# ==========================================
+
 # 1. PRODUCTION CONFIGURATION
-# ==========================================
 app = FastAPI(title="Property Finder Recommendation Engine", version="6.6.0-SORTING-ENABLED")
 
 app.add_middleware(
@@ -41,9 +40,7 @@ PROPERTY_TYPE_MAP = {
 FURNISHED_FILTER_MAP = { 1: ["1", "yes", "true"], 2: ["0", "no", "false"], 3: ["partly"] }
 COMPLETION_FILTER_MAP = { 0: ["completed", "ready"], 1: ["off_plan", "offplan"], 2: ["off_plan", "offplan"] }
 
-# ==========================================
 # 2. UTILITY FUNCTIONS
-# ==========================================
 def haversine_vectorized(lat1, lon1, lat2_series, lon2_series):
     R = 6371 
     phi1, phi2 = np.radians(lat1), np.radians(lat2_series)
@@ -61,9 +58,7 @@ def safe_float(val, precision=2):
     except:
         return 0.0
 
-# ==========================================
 # 3. LIFECYCLE (DATA LOADING)
-# ==========================================
 @app.on_event("startup")
 async def startup_event():
     print("🚀 [INIT] Booting Recommendation Engine...")
@@ -129,9 +124,7 @@ async def startup_event():
 
     ENGINE['status'] = "READY"
 
-# ==========================================
 # 4. REQUEST MODELS (UPDATED WITH SORTING)
-# ==========================================
 class Pagination(BaseModel):
     page: Optional[int] = 1
     limit: Optional[int] = 20
@@ -174,11 +167,9 @@ class SearchFilters(BaseModel):
 class ProtoSearchRequest(BaseModel):
     filters: Optional[SearchFilters] = None
     pagination: Optional[Pagination] = None
-    sorting: Optional[Sorting] = None  # <--- Added Sorting Field
+    sorting: Optional[Sorting] = None  
 
-# ==========================================
 # 5. SEARCH ENGINE LOGIC
-# ==========================================
 @app.post("/api/v1/search")
 async def search(req: ProtoSearchRequest):
     if ENGINE['status'] != "READY":
@@ -356,3 +347,4 @@ async def search(req: ProtoSearchRequest):
         "properties": results
 
     }
+
