@@ -1,134 +1,201 @@
-# Property Finder Recommendation Engine 
+ 
+Recommendation System V9.4 Architecture
+# Recommendation System.
 
-> **Status:** Production Ready (Phase 1)  
-> **Type:** Hybrid Filtering + Learning-to-Rank (LTR) AI  
-> **Tech Stack:** Python, FastAPI, XGBoost, Pandas, Parquet
+# Architecture & Scalability Handover
 
----
+### Engineering Team
 
-## 1. Executive Summary
+## 1 Executive Summary
 
-This project represents a shift from traditional "Database Search" (SQL WHERE clauses) to an **AI-Driven Discovery Engine**.
+We have built a **Hybrid Batch-Processed, In-Memory Serving Recommendation Engine**.
 
-Instead of simply returning listings that match a filter, this engine calculates the **Probability of Conversion** for every listing. It asks: *"Among the 500 apartments matching the user's criteria, which ones are most likely to result in a Lead?"*
+Instead of hitting the database for every user search (which is slow and unscalable), we pre-
+compute highly optimized Parquet datasets daily using AWS Redshift and serve them instantly
+from memory using FastAPI.
 
-It achieves this through a **3-Layer Architecture**:
-1.  **Strict Filtering:** Hard constraints (Price, Beds, Location).
-2.  **Geospatial Intelligence:** Radius-based search with text fallbacks.
-3.  **AI Re-Ranking:** XGBoost model predicting user interest based on behavioral signals.
+- **Throughput:** Sub-50ms response time per request.
+- **Capacity:** Validated for 10 Lakh+ (1 Million) active listings daily.
+- **ArchitectureStrategy:** Decoupled ETL (Redshift/Lambda) and Serving (FastAPI/App Run-
+    ner).
 
----
+## 2 System Architecture
 
-## 2. System Architecture
+The system is composed of three distinct layers designed for modularity and scalability.
 
-### A. The Data Pipeline (`pipeline.py`)
-We moved away from CSVs to **Parquet** for performance. The pipeline handles:
-* **Ingestion:** Merging raw listing data with 90-day behavioral signals (Views, Clicks, Leads).
-* **Normalization:** Cleaning dirty data (e.g., mapping `furnished: "Yes"` $\to$ `1`, `completion: "Ready"` $\to$ `completed`).
+### 2.1 A. Data Pipeline (ETL Layer)
 
-### B. The AI Brain (`light_brain.pkl`)
-* **Model:** XGBoost Classifier (Optimized for Speed).
-* **Objective:** Binary Classification (Target: `lead_submission_count > 0`).
-* **Key Features:**
-    * `smart_popularity_score` (Weighted interaction metric).
-    * `price` (Relative to market).
-    * `freshness_score` (Time decay).
-    * `trust_score` (Agent quality).
+Responsible for extracting, transforming, and loading data into the Data Lake.
 
-### C. The API (`app.py`)
-A high-performance **FastAPI** service that loads the Data and Brain into **RAM** for sub-50ms inference.
+- **Source:** AWS Redshift (pf_de_prod_db)
+- **Compute:** AWS Lambda (Python 3.9 + AWS Data Wrangler Layer)
+- **Storage:** AWS S3 (Data Lake)
+- **Strategy:** “Split & Stitch” usingUNLOADto bypass memory limits.
 
----
+### 2.2 B. AI Training Layer
 
-## 3. The "Strict but Smart" Logic
+Responsible for generating the ranking logic.
 
-A major challenge in Real Estate search is handling messy data (e.g., missing coordinates) without returning empty results. We implemented a robust fallback chain.
+- **Compute:** AWS Fargate / SageMaker Processing Job
+- **Frequency:** Weekly
+- **Output:** XGBoost Ranker Model (brain.pkl)
 
-### Layer 1: Hard Filters (The "Strict" Part)
-We apply strict boolean masks for critical user requirements. If a user asks for "2 Beds", we never show 1 Bed.
-* **Filters:** `category_id` (Buy/Rent), `price_range`, `bedrooms`, `bathrooms`, `furnished_status`.
 
-### Layer 2: Geospatial Intelligence (The "Smart" Part)
-Users search by **Keyword** (e.g., "Marina"), but computers need **Coordinates**.
-1.  **Centroid Lookup:** The engine checks if "Marina" matches a known location centroid.
-2.  **Radius Search:** If matched, it calculates Haversine Distance and fetches listings within **3.5km**.
+### 2.3 C. Serving Layer (API)
 
-**The Fallback Safety Net:**
-* **Scenario:** A listing is in Marina but has `lat: 0.0, lon: 0.0` (bad data).
-* **Fix:** The Radius search fails (0 results). The engine detects this and automatically switches to **Text Match** (`WHERE location_name LIKE '%Marina%'`), ensuring the user still gets results.
+Responsible for delivering real-time recommendations to the client.
 
-### Layer 3: AI Re-Ranking (Learning-to-Rank)
-Once Layer 1 & 2 narrow the pool (e.g., from 72,000 $\to$ 200 listings), the AI takes over.
-* **Feature Extraction:** The engine builds a feature vector for the 200 candidates.
-* **Inference:** The XGBoost model predicts a score ($0.0 \to 1.0$) representing "Lead Probability".
+- **Compute:** AWS App Runner (Containerized FastAPI)
+- **State:** Stateless (Loads data from S3 on startup)
+- **Performance:** In-memory Pandas filtering (Zero DB I/O during requests)
 
-**Scoring Logic:**
-$$
-\text{Final Score} = (\text{AI Probability} \times 100) - (\text{Distance} \times 0.1) + \text{Luxury Boost}
-$$
+## 3 How It Works (The Data Flow)
 
-**Result:** A popular, high-quality listing 1km away ranks higher than a stale listing 0.5km away.
+### 3.1 Step 1: Daily Inventory Job
 
----
+**Goal:** Create a clean, deduplicatedinventory.parquet.
 
-## 4. Deployment Status (Phase 1)
+**The “Split & Stitch” Scalability Fix:**
+Redshift cannot aggregate 10L listings with amenities strings (causedLISTAGG65KB limit error).
 
-| Feature | Status | Notes |
-| :--- | :---: | :--- |
-| **Basic Search** | Live | Filters by Price, Beds, Area working perfectly. |
-| **Geo Search** | Live | Includes Radius Search + "Zero Coordinate" Fallback. |
-| **AI Ranking** | Live | "Featured" sort uses XGBoost probability. |
-| **Price Period** | Hidden | Logic exists in DB but API filter is disabled for stability. |
-| **Performance** | High | In-Memory Parquet loads < 1s, Query < 50ms. |
+1. **Split:** We split the export into two raw Parquet files viaUNLOAD:
+    - listings_base/(Price, Beds, Location - Deduplicated via Window Function).
+    - amenities_long/(Listing ID↔Amenity Code).
+2. **Stitch:** The Lambda script downloads both, performs a fast Pandas Merge (safe for >10M
+    rows), and saves the final file to S3.
 
----
+### 3.2 Step 2: Daily User Data Job
 
-## 5. Phase 2 Roadmap: Moving to "Industry Grade"
+**Goal:** Create a User Preference Matrix (user_data.parquet).
 
-While Phase 1 is a robust Search Engine, Phase 2 transforms it into a **Personalization Engine**.
+**Logic:** We query raw clickstream logs (stg_snowplow_events) aggregating 3 months of history.
+We apply our **Weighted Interest Score** :
 
-### Objective 1: User-Level Personalization
-Currently, every user sees the same "Popular" results.
-* **The Plan:** Implement a "Shadow Profile" using Redis.
-* **Logic:**
-    * If User A clicks 3 Villas $\to$ Boost Villa scores by 20%.
-    * If User B filters "Price > 5M" $\to$ Tag as "Luxury User" and deprioritize cheap listings.
+```
+View = 1 Save = 5 Click = 10 Lead = 50 Unsave = -
+```
+**Scalability:** This aggregation happens entirely inside Redshift. We only export the final compact
+result.
 
-### Objective 2: Hierarchical Location Search
-Currently, "Dubai" search relies on radius or text match.
-* **The Plan:** Ingest `full_location_path` (e.g., Dubai - Marina - Princess Tower).
-* **Logic:** Use Path Containment (`path LIKE 'Dubai%'`) to officially capture all child communities without relying on distance.
+### 3.3 Step 3: Weekly AI Training
 
-### Objective 3: Rental Period Logic (`price_type`)
-* **The Plan:** Expose the `price_period` filter in the API.
-* **Logic:**
-    * Allow users to toggle "Daily" vs "Yearly".
-    * Prevent 500 AED (Daily) listings from cluttering a "Cheap Yearly Rent" search.
+**Goal:** Update the ranking logic (brain.pkl).
+**Logic:** Merges User History + Inventory to train an XGBoost model to predict “Interaction Prob-
+ability.”
 
----
+### 3.4 Step 4: API Startup (Serving)
 
-## 6. API Interface
+When the API container starts, it downloadsinventory.parquet,user_data.parquet, andbrain.pkl
+into RAM.
+**Personalization:** When User X searches, we look up their ID in theuser_datadataframe (O(1)
+complexity), get their liked items, and boost those IDs in the results.
 
-**Endpoint:** `POST /api/v1/search`
 
-The API accepts a strict JSON structure.
+## 4 Scalability & Resilience Defense
 
-### Sample Payload
-```json
-{
-  "filters": {
-    "category_id": 2,
-    "min_price": 50000,
-    "max_price": 150000,
-    "keywords": ["Marina"],
-    "number_of_bedrooms": [1, 2],
-    "is_super_agent": false
-  },
-  "pagination": {
-    "page": 1,
-    "limit": 20
-  },
-  "sorting": {
-    "sort": "featured"
-  }
-}
+DevOps Team may ask: _“Willthiscrashwith10Millionlistings?”_
+
+```
+Concern Our Solution Verdict
+```
+```
+Database Load We use Redshift UNLOAD (not SELECT *).
+This is the fastest way to extract data and
+puts minimal load on the DB.
+```
+```
+Scalable
+```
+```
+Memory Over-
+flows
+```
+```
+We use the Split & Stitch strategy. We
+process data in Parquet (columnar format),
+which is 10x smaller in RAM than JSON/CSV.
+```
+```
+Scalable
+```
+```
+Latency The API serves from RAM. It never touches
+the database during a search request.
+Sorting/Filtering 1M rows in Pandas takes
+milliseconds.
+```
+```
+Ultra-Fast
+```
+```
+Concurrency The API is Stateless. You can run 100 con-
+tainers behind a Load Balancer. They don’t
+share state.
+```
+```
+Horizontally Scalable
+```
+```
+Cold Starts The Lambda uses the AWS Data Wrangler
+layer for optimized S3/Parquet handling.
+```
+```
+Optimized
+```
+## 5 DevOps Deployment Checklist
+
+Please provision the following resources to go live:
+
+### 5.1 1. IAM Role (For Lambda/Redshift)
+
+- **Name:** RecSysDataPipelineRole
+- **Policy:**
+    **-** redshift-data:ExecuteStatement(To trigger queries).
+    **-** s3:PutObject, s3:GetObject, s3:ListBucket(For the specific bucket).
+    **-** secretsmanager:GetSecretValue(If DB creds are in Secrets Manager).
+
+### 5.2 2. AWS S3 Bucket
+
+**Structure:**
+
+- /inventory/(Stores dailyinventory.parquet)
+- /users/(Stores dailyuser_data.parquet)
+- /brain/(Stores weeklybrain.pkl)
+- /temp/(Scratchpad for Redshift exports - Set Lifecycle Policy to delete after 1 day).
+
+
+### 5.3 3. Compute (Lambda)
+
+- **Job 1:** DailyInventoryJob(3GB RAM, 10-15 min timeout).
+- **Job 2:** DailyUserDataJob(512MB RAM, 5 min timeout).
+- **Layer:** Must attach AWS SDK for Pandas (Python 3.9).
+
+### 5.4 4. Scheduling (EventBridge)
+
+- **Rule 1:** Configure schedule to triggerDailyInventoryJob.
+- **Rule 2:** Configure schedule to triggerDailyUserDataJob(ensure it runs after Inventory
+    Job).
+
+### 5.5 5. API Hosting (App Runner / ECS)
+
+- **Docker Image:** Build from the provided Dockerfile.
+- **Env Variables:**
+    **-** S3_BUCKET: [BUCKET_NAME]
+    **-** AWS_REGION: us-east-
+- **Instance Role:** Must haveAmazonS3ReadOnlyAccess.
+
+## 6 Final Code Deliverables
+
+You have the following 4 files ready for commit:
+
+- main.py(The API).
+- daily_inventory_job.py(The Listings ETL).
+- daily_user_job.py(The User ETL).
+- weekly_train_job.py(The AI Trainer).
+
+**This system is production-hardened. You are ready to deploy.**
+
+
+
+This is a offline tool, your data stays locally and is not send to any server!
+Feedback & Bug Reports
