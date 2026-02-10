@@ -1,0 +1,130 @@
+WITH 
+-- 1. Active Listings (Base Metadata)
+active_listings AS (
+    SELECT 
+        l.property_listing_id, 
+        l.agent_id, 
+        l.key_location, 
+        
+        -- DISPLAY FIELDS
+        l.property_type,          
+        l.property_title,         
+        l.property_address,       
+        l.listing_level,          
+        l.pending_verified_flag,  
+        l.bedrooms,               
+        l.bathrooms,
+        l.property_sqft,
+        l.completion_status,
+        l.furnished_flag,
+        l.start_time,
+        l.property_serp_score,
+
+        -- [FIX 1] SAFE BEDROOMS EXTRACTION
+        -- 1. Extract digits
+        -- 2. If result is empty string, turn to NULL
+        -- 3. Then Cast to Int
+        CAST(NULLIF(REGEXP_SUBSTR(l.bedrooms, '[0-9]+'), '') AS INT) as bedrooms_int
+
+    FROM 
+        pf_de_prod_db.pf_dwh.dim_property_listing l
+    WHERE 
+        l.property_listing_status = 'online'
+        AND l.start_time >= DATEADD(month, -6, GETDATE()) 
+),
+
+-- 2. Prices & Categories (The most likely error source)
+valid_prices AS (
+    SELECT 
+        web_id, 
+        p.pp_price,
+        p.price_type,      
+        p.offering_type
+    FROM pf_de_prod_db.pf_dwh.fct_pricing_all_listings_reporting p
+    WHERE 
+        -- [FIX 2] SAFE PRICE CHECK
+        -- Only attempt comparison if price is actually a number
+        p.pp_price IS NOT NULL 
+        AND p.pp_price ~ '^[0-9.]+$' -- Regex: Only digits and dots
+        AND CAST(p.pp_price AS DECIMAL(18,2)) > 0
+),
+
+-- 3. Locations
+geo_data AS (
+    SELECT 
+        key_location,
+        location_id,     
+        coordinates_lat, 
+        coordinates_lon,
+        COALESCE(location_name_english, location_name_primary) as location_name,
+        COALESCE(location_tower_name, location_path_name_primary) as full_location_path
+    FROM 
+        pf_de_prod_db.pf_dwh.dim_location
+    WHERE 
+        coordinates_lat IS NOT NULL 
+        AND coordinates_lat != 0
+)
+
+-- 4. MASTER PRODUCTION JOIN
+SELECT 
+    l.property_listing_id,
+    
+    -- GEOSPATIAL
+    g.location_id,           
+    g.coordinates_lat as latitude,
+    g.coordinates_lon as longitude,
+    g.location_name,         
+    g.full_location_path,    
+  
+    -- METADATA
+    l.property_title,
+    l.property_address,
+    l.listing_level,
+    l.pending_verified_flag,
+    l.start_time as listing_date,
+
+    -- SPECS
+    l.property_type,         
+    l.bedrooms_int,          -- Uses the SAFE integer version
+    l.bedrooms as bedrooms_label, -- Uses the original string version
+    l.bathrooms,
+    l.property_sqft as size_sqft,
+    l.completion_status,
+    l.furnished_flag,
+
+    -- CATEGORIZATION
+    p.offering_type,         
+    
+    -- MAP CATEGORY ID (Safe Case)
+    CASE 
+        WHEN LOWER(p.offering_type) LIKE '%sale%' THEN 1
+        WHEN LOWER(p.offering_type) LIKE '%rent%' THEN 2
+        ELSE 0 
+    END as category_id,
+
+    -- MAP PROPERTY TYPE ID (Safe Fallback if column missing)
+    -- We derive this from string if ID is missing or dirty
+    CASE 
+        WHEN LOWER(l.property_type) LIKE '%apartment%' THEN 1
+        WHEN LOWER(l.property_type) LIKE '%villa%' THEN 35
+        WHEN LOWER(l.property_type) LIKE '%townhouse%' THEN 22
+        WHEN LOWER(l.property_type) LIKE '%penthouse%' THEN 20
+        ELSE 0 
+    END as property_type_id,
+
+    -- FINANCIALS
+    CAST(p.pp_price AS DECIMAL(18,2)) as price, -- Explicit cast
+    p.price_type as price_period,
+    
+    -- RANKING
+    l.property_serp_score as quality_score,
+    COALESCE(s.super_agent_score, 0) as super_agent_score
+
+FROM 
+    active_listings l
+JOIN 
+    valid_prices p ON l.property_listing_id = p.web_id
+JOIN 
+    geo_data g ON l.key_location = g.key_location
+LEFT JOIN 
+    pf_de_prod_db.pf_dwh.agg_ae_new_superagent_score s ON l.agent_id = s.agent_id;
