@@ -1,0 +1,57 @@
+{
+  "settings": {
+    "index": {
+      "knn": true,
+      "knn.algo_param.ef_search": 100,
+      "number_of_shards": 3,
+      "number_of_replicas": 1,
+      "refresh_interval": "30s"
+    }
+  },
+  "mappings": {
+    "properties": {
+      "property_listing_id": { "type": "keyword" },
+      "category_id":         { "type": "integer" },
+      "property_type_id":    { "type": "integer" },
+      "property_type":       { "type": "keyword" },
+
+      "price":               { "type": "float" },
+      "price_period":        { "type": "keyword" },
+
+      "bedrooms":            { "type": "integer" },
+      "bedrooms_label":      { "type": "keyword" },
+      "bathrooms":           { "type": "float" },
+      "size_sqft":           { "type": "float" },
+
+      "location_id":         { "type": "keyword" },
+      "location_name":       { "type": "keyword" },
+      "full_location_path":  { "type": "keyword" },
+      "location_coordinates": { "type": "geo_point" },
+      "latitude":            { "type": "float" },
+      "longitude":           { "type": "float" },
+
+      "amenities":           { "type": "integer" },
+      "is_verified":         { "type": "boolean" },
+      "agent_id":            { "type": "keyword" },
+      "listing_date":        { "type": "date" },
+
+      "listing_level":       { "type": "keyword" },
+      "quality_score":       { "type": "float" },
+      "super_agent_score":   { "type": "float" },
+      "popularity_score":    { "type": "float" },
+
+      "completion_status":   { "type": "keyword" },
+      "furnished_flag":      { "type": "keyword" },
+
+      "property_vector": {
+        "type": "knn_vector",
+        "dimension": 384,
+        "method": {
+          "name": "hnsw",
+          "space_type": "cosinesimil",
+          "engine": "lucene"
+        }
+      }
+    }
+  }
+}

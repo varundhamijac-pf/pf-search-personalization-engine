@@ -1,0 +1,7 @@
+{
+  "app": "python3 app.py",
+  "context": {
+    "account": "",
+    "region": "me-south-1"
+  }
+}

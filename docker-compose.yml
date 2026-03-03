@@ -1,0 +1,131 @@
+version: '3.8'
+
+services:
+  # ─── Ranking Model-as-a-Service ─────────────────────────────────────
+  ranking-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    # CRITICAL FIX (C-1): Reduced to 1 worker. brain.pkl is huge. 
+    # Multiple workers load multiple copies into RAM causing OOMs.
+    # asyncio.to_thread handles concurrency safely within 1 worker.
+    command: uvicorn ranking_api:app --host 0.0.0.0 --port 8002 --workers 1
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./artifacts:/app/artifacts
+    environment:
+      - BRAIN_PATH=/app/artifacts/brain.pkl
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  # ─── SERP Search API ────────────────────────────────────────────────
+  search-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    command: uvicorn search_api:app --host 0.0.0.0 --port 8000 --workers 4
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENSEARCH_HOST=opensearch
+      - REDIS_HOST=redis
+      - RANKING_API_URL=http://ranking-api:8002
+      - OPENSEARCH_INDEX=pf-inventory-v1
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ranking-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # ─── PDP Recommendation API ─────────────────────────────────────────
+  recsys-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    command: uvicorn recsys_api:app --host 0.0.0.0 --port 8001 --workers 4
+    ports:
+      - "8001:8001"
+    environment:
+      - OPENSEARCH_HOST=opensearch
+      - REDIS_HOST=redis
+      - RANKING_API_URL=http://ranking-api:8002
+      - OPENSEARCH_INDEX=pf-inventory-v1
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ranking-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # ─── OpenSearch ─────────────────────────────────────────────────────
+  opensearch:
+    image: opensearchproject/opensearch:2.11.0
+    environment:
+      - discovery.type=single-node
+      - plugins.security.disabled=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g"
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health?wait_for_status=yellow || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+
+  # ─── Redis ──────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy volatile-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  opensearch-data:
+  redis-data:
