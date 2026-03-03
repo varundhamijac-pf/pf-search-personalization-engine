@@ -18,5 +18,8 @@ COPY seed_data.py .
 COPY sagemaker_pipeline.py .
 COPY opensearch_mapping.json .
 
+# Create dirs for SageMaker Processing Job paths
+RUN mkdir -p /app/artifacts /opt/ml/processing/input /opt/ml/processing/output
+
 # Default: health check port
 EXPOSE 8000 8001 8002

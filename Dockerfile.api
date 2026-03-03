@@ -2,8 +2,9 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# System deps
+# System deps (curl for health checks, awscli for S3 artifact download)
 RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir awscli
 
 # Python deps — API-only (no sentence-transformers, no scikit-learn)
 COPY requirements-api.txt .
@@ -16,6 +17,9 @@ COPY search_api.py .
 COPY recsys_api.py .
 COPY seed_data.py .
 COPY opensearch_mapping.json .
+
+# Create artifacts dir for brain.pkl
+RUN mkdir -p /app/artifacts
 
 # Default: health check port
 EXPOSE 8000 8001 8002

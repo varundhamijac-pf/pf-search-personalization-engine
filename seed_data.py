@@ -29,9 +29,18 @@ REDIS_DNA_TTL = 259200
 REDIS_PIPELINE_BATCH = 500
 BULK_CHUNK_SIZE = 500
 
+# ═══════════════════════════════════════════════════════════════════════
+# AWS CHANGE: Support managed OpenSearch (HTTPS on port 443)
+# Local Docker: OPENSEARCH_SSL=false, OPENSEARCH_PORT=9200
+# AWS Managed:  OPENSEARCH_SSL=true,  OPENSEARCH_PORT=443
+# ═══════════════════════════════════════════════════════════════════════
+_os_ssl = os.getenv("OPENSEARCH_SSL", "false").lower() == "true"
+_os_port = int(os.getenv("OPENSEARCH_PORT", "443" if _os_ssl else "9200"))
+
 os_client = OpenSearch(
-    hosts=[{'host': OS_HOST, 'port': 9200}],
-    use_ssl=False, verify_certs=False,
+    hosts=[{'host': OS_HOST, 'port': _os_port}],
+    use_ssl=_os_ssl,
+    verify_certs=_os_ssl,
     timeout=60,
 )
 redis_client = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
@@ -111,8 +120,12 @@ def prepare_document(row: dict) -> dict:
     return doc
 
 def _load_mapping() -> dict:
-    with open(MAPPING_FILE, 'r') as f:
-        return json.load(f)
+    # AWS CHANGE: Look for mapping file in multiple locations
+    for path in [MAPPING_FILE, os.path.join(os.path.dirname(__file__), MAPPING_FILE), "/app/opensearch_mapping.json"]:
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                return json.load(f)
+    raise FileNotFoundError(f"opensearch_mapping.json not found in any expected location")
 
 def _get_indices_behind_alias() -> list:
     try:

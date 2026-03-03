@@ -11,6 +11,7 @@ import joblib
 import os
 import sys
 import time
+import glob
 from sklearn.cluster import KMeans
 
 # STRICT MODE: Force sentence-transformers. No fallback logic.
@@ -38,6 +39,26 @@ EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", 'sentence-transformers/
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "384"))
 EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "512"))
 BRAIN_VERSION = "v15.3-GeoRanker"  # Added distance_km feature for geo-aware ranking
+
+# ═══════════════════════════════════════════════════════════════════════
+# AWS CHANGE 1: S3 upload after saving artifacts locally
+# Set S3_BUCKET env var to enable (empty = disabled, local-only mode)
+# ═══════════════════════════════════════════════════════════════════════
+S3_BUCKET = os.getenv("S3_BUCKET", "")
+S3_ARTIFACTS_PREFIX = os.getenv("S3_ARTIFACTS_PREFIX", "artifacts")
+
+def _upload_to_s3(local_path: str, s3_key: str):
+    """Upload a file to S3 if S3_BUCKET is configured. No-op locally."""
+    if not S3_BUCKET:
+        return
+    try:
+        import boto3
+        s3 = boto3.client('s3')
+        s3.upload_file(local_path, S3_BUCKET, s3_key)
+        logger.info(f"Uploaded {local_path} → s3://{S3_BUCKET}/{s3_key}")
+    except Exception as e:
+        logger.warning(f"S3 upload failed for {local_path}: {e}")
+
 
 def _load_embedding_model():
     logger.info(f"Backend: sentence-transformers — {EMBEDDING_MODEL_NAME}")
@@ -160,12 +181,7 @@ def train_ranker(df_listings: pd.DataFrame, df_interactions: pd.DataFrame):
     df_train = df_train.sort_values('user_id')
 
     # ══════════════════════════════════════════════════════════════════
-    # NEW: Compute distance_km for training pairs
-    #
-    # For each user, find their "anchor" listing (highest interaction_score).
-    # Then compute haversine distance from that anchor to every other
-    # listing the user interacted with. This teaches XGBRanker to weigh
-    # geographic proximity as a ranking signal.
+    # Compute distance_km for training pairs
     # ══════════════════════════════════════════════════════════════════
     lat_col = 'latitude'
     lon_col = 'longitude'
@@ -175,7 +191,6 @@ def train_ranker(df_listings: pd.DataFrame, df_interactions: pd.DataFrame):
         df_train[lat_col] = pd.to_numeric(df_train[lat_col], errors='coerce').fillna(0.0)
         df_train[lon_col] = pd.to_numeric(df_train[lon_col], errors='coerce').fillna(0.0)
 
-        # Find each user's anchor listing (highest interaction_score)
         score_col = 'interaction_score'
         if score_col not in df_train.columns:
             score_col = None
@@ -183,7 +198,6 @@ def train_ranker(df_listings: pd.DataFrame, df_interactions: pd.DataFrame):
         if score_col:
             anchor_idx = df_train.groupby('user_id')[score_col].idxmax()
         else:
-            # Fallback: first listing per user
             anchor_idx = df_train.groupby('user_id').apply(lambda g: g.index[0])
 
         anchor_coords = df_train.loc[anchor_idx, ['user_id', lat_col, lon_col]].rename(
@@ -191,7 +205,6 @@ def train_ranker(df_listings: pd.DataFrame, df_interactions: pd.DataFrame):
         )
         df_train = df_train.merge(anchor_coords, on='user_id', how='left')
 
-        # Vectorized haversine
         valid_mask = (
             (df_train['anchor_lat'] != 0) & (df_train['anchor_lon'] != 0) &
             (df_train[lat_col] != 0) & (df_train[lon_col] != 0)
@@ -205,15 +218,12 @@ def train_ranker(df_listings: pd.DataFrame, df_interactions: pd.DataFrame):
                 df_train.loc[valid_mask, lon_col].values,
             )
 
-        # Log diagnostics
         dist_vals = df_train['distance_km']
         non_zero_dist = (dist_vals > 0).sum()
         logger.info(
             f"  distance_km computed: min={dist_vals.min():.2f}, max={dist_vals.max():.2f}, "
             f"mean={dist_vals.mean():.2f}, non_zero={non_zero_dist}/{len(dist_vals)}"
         )
-
-        # Cleanup temp columns
         df_train.drop(columns=['anchor_lat', 'anchor_lon'], inplace=True, errors='ignore')
     else:
         logger.warning(
@@ -229,15 +239,9 @@ def train_ranker(df_listings: pd.DataFrame, df_interactions: pd.DataFrame):
     
     # ══════════════════════════════════════════════════════════════════
     # FIX RC-2: Scale floats by 10 and round to PRESERVE VARIANCE
-    # 
-    # Before: ceil(0.13)=1, ceil(0.52)=1, ceil(1.0)=1 → all same label
-    # After:  round(0.13*10)=1, round(0.52*10)=5, round(1.0*10)=10 → variance!
     # ══════════════════════════════════════════════════════════════════
     y = np.clip(np.round(y_float * 10).astype(int), 0, 31)
     
-    # ══════════════════════════════════════════════════════════════════
-    # FIX CF-A: Log label distribution — this is where you catch "Dead Matrix"
-    # ══════════════════════════════════════════════════════════════════
     unique_labels = np.unique(y)
     logger.info(
         f"  Label distribution: min={y.min()}, max={y.max()}, "
@@ -249,7 +253,6 @@ def train_ranker(df_listings: pd.DataFrame, df_interactions: pd.DataFrame):
         f"max={y_float.max():.4f}, mean={y_float.mean():.4f}"
     )
     
-    # Feature matrix sanity check
     feature_sums = X.sum()
     zero_features = feature_sums[feature_sums == 0].index.tolist()
     if zero_features:
@@ -264,11 +267,9 @@ def train_ranker(df_listings: pd.DataFrame, df_interactions: pd.DataFrame):
             f"XGBRanker needs ≥2 distinct labels to learn ranking. "
             f"Check interaction_score values in your data."
         )
-        # Still train (it won't crash), but the model will be useless
     
     qid = df_train['user_id'].factorize()[0]
 
-    # FIX: ndcg_exp_gain=False for XGBoost ≥ 2.1 compatibility (labels must be ≤ 31 with exp gain)
     model = xgb.XGBRanker(
         objective='rank:ndcg',
         n_estimators=300,
@@ -283,10 +284,6 @@ def train_ranker(df_listings: pd.DataFrame, df_interactions: pd.DataFrame):
         model.fit(X, y, qid=qid)
         logger.info("XGBRanker trained successfully.")
         
-        # ══════════════════════════════════════════════════════════════
-        # FIX CF-B: Post-training validation — predict on training data
-        # to confirm model actually learned something
-        # ══════════════════════════════════════════════════════════════
         sample_preds = model.predict(X.head(min(10, len(X))))
         logger.info(
             f"  Post-training validation scores (first {len(sample_preds)}): "
@@ -314,6 +311,9 @@ def train_ranker(df_listings: pd.DataFrame, df_interactions: pd.DataFrame):
     joblib.dump(brain, brain_path)
     logger.info(f"Saved brain.pkl: version={BRAIN_VERSION}, features={len(MODEL_FEATURES)}")
 
+    # AWS CHANGE 1: Upload brain.pkl to S3
+    _upload_to_s3(brain_path, f"{S3_ARTIFACTS_PREFIX}/brain.pkl")
+
 def export_artifacts(df_listings: pd.DataFrame, user_dna: pd.DataFrame, is_delta: bool = False):
     os.makedirs(ARTIFACTS_DIR, exist_ok=True)
 
@@ -325,10 +325,16 @@ def export_artifacts(df_listings: pd.DataFrame, user_dna: pd.DataFrame, is_delta
     df_out.to_parquet(inv_path, index=False)
     logger.info(f"Saved {inv_path}: {len(df_out)} listings")
 
+    # AWS CHANGE 1: Upload inventory to S3
+    _upload_to_s3(inv_path, f"{S3_ARTIFACTS_PREFIX}/inventory{suffix}.parquet")
+
     if not is_delta and not user_dna.empty:
         dna_path = os.path.join(ARTIFACTS_DIR, "user_vectors.parquet")
         user_dna.to_parquet(dna_path, index=False)
         logger.info(f"Saved {dna_path}: {len(user_dna)} user profiles")
+
+        # AWS CHANGE 1: Upload user_vectors to S3
+        _upload_to_s3(dna_path, f"{S3_ARTIFACTS_PREFIX}/user_vectors.parquet")
 
     return df_out
 
@@ -340,14 +346,10 @@ def run_full_pipeline(inventory_path: str, interactions_path: str):
     df_interactions = pd.read_parquet(interactions_path)
     logger.info(f"Loaded {len(df_listings)} listings, {len(df_interactions)} interactions")
     
-    # ══════════════════════════════════════════════════════════════════
-    # FIX RC-3: Normalize IDs immediately after loading
-    # ══════════════════════════════════════════════════════════════════
     df_listings['property_listing_id'] = df_listings['property_listing_id'].astype(str).str.strip()
     df_interactions['property_listing_id'] = df_interactions['property_listing_id'].astype(str).str.strip()
     df_interactions['user_id'] = df_interactions['user_id'].astype(str).str.strip()
     
-    # Log data quality
     logger.info(f"  Listing ID dtype: {df_listings['property_listing_id'].dtype}, sample: {df_listings['property_listing_id'].head(3).tolist()}")
     logger.info(f"  Interaction ID dtype: {df_interactions['property_listing_id'].dtype}, sample: {df_interactions['property_listing_id'].head(3).tolist()}")
     
@@ -367,13 +369,21 @@ def run_full_pipeline(inventory_path: str, interactions_path: str):
 
     df_out = export_artifacts(df_listings, user_dna, is_delta=False)
 
-    try:
-        from seed_data import seed_opensearch_full, seed_redis
-        seed_opensearch_full(df_out)
-        seed_redis()
-        logger.info("OpenSearch index swapped and Redis DNA loaded.")
-    except Exception as e:
-        logger.error(f"Seeding failed (manual seed_data.py run required): {e}")
+    # ══════════════════════════════════════════════════════════════════
+    # AWS CHANGE 3: Skip local seeding when running in SageMaker
+    # SageMaker containers don't have access to OpenSearch/Redis.
+    # The post-training Lambda handles seeding instead.
+    # ══════════════════════════════════════════════════════════════════
+    if os.getenv("SM_PROCESSING_JOB_NAME"):
+        logger.info("Running in SageMaker — skipping local seeding. Post-training Lambda will handle it.")
+    else:
+        try:
+            from seed_data import seed_opensearch_full, seed_redis
+            seed_opensearch_full(df_out)
+            seed_redis()
+            logger.info("OpenSearch index swapped and Redis DNA loaded.")
+        except Exception as e:
+            logger.error(f"Seeding failed (manual seed_data.py run required): {e}")
 
     elapsed = time.time() - t0
     logger.info(f"=== FULL PIPELINE COMPLETE in {elapsed:.1f}s ===")
@@ -394,27 +404,73 @@ def run_delta_pipeline(delta_inventory_path: str):
 
     df_out = export_artifacts(df_delta, pd.DataFrame(), is_delta=True)
 
-    try:
-        from seed_data import seed_opensearch_delta
-        seed_opensearch_delta(df_out)
-        logger.info(f"Delta upserted {len(df_out)} new listings into OpenSearch.")
-    except Exception as e:
-        logger.error(f"Delta upsert failed: {e}")
+    if os.getenv("SM_PROCESSING_JOB_NAME"):
+        logger.info("Running in SageMaker — skipping local delta seeding.")
+    else:
+        try:
+            from seed_data import seed_opensearch_delta
+            seed_opensearch_delta(df_out)
+            logger.info(f"Delta upserted {len(df_out)} new listings into OpenSearch.")
+        except Exception as e:
+            logger.error(f"Delta upsert failed: {e}")
 
     elapsed = time.time() - t0
     logger.info(f"=== DELTA PIPELINE COMPLETE in {elapsed:.1f}s ===")
 
+
+# ═══════════════════════════════════════════════════════════════════════
+# AWS CHANGE 2: SageMaker Processing Job path detection
+#
+# SageMaker mounts input data to /opt/ml/processing/input/
+# and expects output at /opt/ml/processing/output/
+# Redshift UNLOAD creates multiple .parquet parts in a directory,
+# so we use _find_parquet() to handle both single files and directories.
+#
+# Local mode: Unchanged — reads from artifacts/ directory.
+# ═══════════════════════════════════════════════════════════════════════
+def _find_parquet(directory: str) -> str:
+    """Find parquet file(s) in a directory. Returns directory path if multiple parts (pd.read_parquet handles it)."""
+    files = sorted(glob.glob(os.path.join(directory, "*.parquet")))
+    if not files:
+        raise FileNotFoundError(f"No .parquet files found in {directory}")
+    if len(files) > 1:
+        logger.info(f"Found {len(files)} parquet parts in {directory}, reading as directory...")
+        return directory  # pd.read_parquet can read a directory of parquet files
+    return files[0]
+
+
 if __name__ == "__main__":
     is_delta = "--delta" in sys.argv
 
-    if is_delta:
-        inv_path = (
-            sys.argv[sys.argv.index("--delta") + 1]
-            if len(sys.argv) > sys.argv.index("--delta") + 1
-            else os.path.join(ARTIFACTS_DIR, "inventory_delta.parquet")
-        )
-        run_delta_pipeline(inv_path)
+    sm_input_base = "/opt/ml/processing/input"
+    sm_output_base = "/opt/ml/processing/output"
+    is_sagemaker = os.path.exists(sm_input_base)
+
+    if is_sagemaker:
+        logger.info("Detected SageMaker Processing Job environment.")
+        ARTIFACTS_DIR = sm_output_base
+        os.makedirs(ARTIFACTS_DIR, exist_ok=True)
+
+        inv_dir = os.path.join(sm_input_base, "inventory")
+        inter_dir = os.path.join(sm_input_base, "interactions")
+
+        if is_delta:
+            delta_path = _find_parquet(inv_dir)
+            run_delta_pipeline(delta_path)
+        else:
+            inv_path = _find_parquet(inv_dir)
+            inter_path = _find_parquet(inter_dir)
+            run_full_pipeline(inv_path, inter_path)
     else:
-        inv = os.path.join(ARTIFACTS_DIR, "inventory.parquet")
-        inter = os.path.join(ARTIFACTS_DIR, "interactions.parquet")
-        run_full_pipeline(inv, inter)
+        # Local mode (unchanged behavior)
+        if is_delta:
+            inv_path = (
+                sys.argv[sys.argv.index("--delta") + 1]
+                if len(sys.argv) > sys.argv.index("--delta") + 1
+                else os.path.join(ARTIFACTS_DIR, "inventory_delta.parquet")
+            )
+            run_delta_pipeline(inv_path)
+        else:
+            inv = os.path.join(ARTIFACTS_DIR, "inventory.parquet")
+            inter = os.path.join(ARTIFACTS_DIR, "interactions.parquet")
+            run_full_pipeline(inv, inter)
